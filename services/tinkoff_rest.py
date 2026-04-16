@@ -110,7 +110,6 @@ class TinkoffRestClient:
         data = await self._post("InstrumentsService", "FindInstrument", {
             "query": ticker,
             "instrumentKind": "INSTRUMENT_TYPE_UNSPECIFIED",
-            "apiTradeAvailableFlag": True,
         })
         instruments = data.get("instruments", [])
         for inst in instruments:

@@ -267,33 +267,33 @@ async def run_daily_analysis(client) -> tuple[str, list[dict]]:
     for instrument in WATCHLIST:
         ticker = instrument["ticker"]
         try:
-            # Получаем свечи напрямую с MOEX (не нужен брокер)
-            candles = await moex_get_candles(ticker, days=65)
+            candles = []
 
-            if not candles or len(candles) < 5:
-                # Fallback: пробуем через tinkoff_client (если есть токен)
-                if client and client.is_available:
+            # 1. Приоритет: Т-Банк API (если токен задан — самые точные данные)
+            if client and client.is_available:
+                try:
                     inst_info = await client.find_instrument(ticker)
                     if inst_info:
                         candles = await client.get_candles(
                             figi=inst_info["figi"], days=65, interval_str="day"
                         )
+                        if candles:
+                            logger.debug(f"{ticker}: данные из Т-Банк API ({len(candles)} свечей)")
+                except Exception as e:
+                    logger.warning(f"{ticker}: ошибка Т-Банк API: {e}")
 
+            # 2. MOEX бесплатный API (если нет токена или Т-Банк не ответил)
             if not candles or len(candles) < 5:
-                # Fallback: пробуем через tinkoff_client (если есть токен)
-                if client and client.is_available:
-                    inst_info = await client.find_instrument(ticker)
-                    if inst_info:
-                        candles = await client.get_candles(
-                            figi=inst_info["figi"], days=65, interval_str="day"
-                        )
+                candles = await moex_get_candles(ticker, days=65)
+                if candles and len(candles) >= 5:
+                    logger.debug(f"{ticker}: данные из MOEX ({len(candles)} свечей)")
 
+            # 3. Синтетический fallback (если внешние API недоступны с сервера)
             if not candles or len(candles) < 5:
-                # Последний резерв: синтетические данные на основе известных цен
+                logger.warning(f"{ticker}: внешние API недоступны, используем синтетику")
                 candles = _generate_fallback_candles(ticker)
 
             if not candles or len(candles) < 5:
-                logger.warning(f"Анализ {ticker}: нет данных ни от MOEX, ни от брокера")
                 errors.append(ticker)
                 continue
 

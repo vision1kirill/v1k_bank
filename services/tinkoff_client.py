@@ -81,9 +81,11 @@ class TinkoffClient:
         if ok:
             self._account_id = self._rest.account_id
             mode = "SANDBOX" if self.use_sandbox else "РЕАЛЬНЫЙ"
-            logger.info(f"T-Bank REST API подключён. Режим: {mode}. Счёт: {self._account_id}")
+            logger.info(f"✅ T-Bank REST API подключён. Режим: {mode}. Счёт: {self._account_id}")
+            logger.info(f"✅ Цены и данные будут браться напрямую из Т-Инвестиций")
         else:
-            logger.error("Не удалось подключиться к T-Bank API. Проверь токен.")
+            logger.error("❌ Не удалось подключиться к T-Bank API. Проверь токен в переменных Railway.")
+            logger.error("❌ Цены будут браться с MOEX (бесплатно) или из синтетики.")
             self._rest = None
 
         self._initialized = True
