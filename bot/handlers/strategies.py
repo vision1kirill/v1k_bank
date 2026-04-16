@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
     STATE_DIV_CONFIRM,
     # Пополнение бюджета
     STATE_TOPUP_AMOUNT,
-) = range(7)
+) = range(6)
 
 CANCEL_MSG = "❌ Создание стратегии отменено."
 _ANALYZING_MSG = "🔍 Анализирую рынок и подбираю лучший вариант для тебя..."
