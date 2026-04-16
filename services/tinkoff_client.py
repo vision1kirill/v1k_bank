@@ -132,7 +132,11 @@ class TinkoffClient:
             return self._instruments_cache[ticker]
 
         if not self.is_available:
-            return self._mock_instrument(ticker)
+            instrument = self._mock_instrument(ticker)
+            # Заполняем кэш чтобы _figi_to_ticker работал
+            self._figi_cache[instrument["figi"]] = instrument
+            self._instruments_cache[ticker] = instrument
+            return instrument
 
         try:
             from tinkoff.invest import AsyncClient, InstrumentStatus
@@ -202,6 +206,14 @@ class TinkoffClient:
             return cached[0]
 
         if not self.is_available:
+            # Пробуем получить реальную цену с MOEX по тикеру
+            ticker = self._figi_to_ticker(figi)
+            if ticker:
+                from services.moex_client import get_last_price as moex_price
+                price = await moex_price(ticker)
+                if price:
+                    self._price_cache[figi] = (price, datetime.utcnow())
+                    return price
             return self._mock_price(figi)
 
         try:
@@ -229,6 +241,12 @@ class TinkoffClient:
         Возвращает list[{time, open, high, low, close, volume}]
         """
         if not self.is_available:
+            ticker = self._figi_to_ticker(figi)
+            if ticker:
+                from services.moex_client import get_candles as moex_candles
+                candles = await moex_candles(ticker, days)
+                if candles:
+                    return candles
             return self._mock_candles(figi, days)
 
         try:
@@ -520,6 +538,28 @@ class TinkoffClient:
 
     # ─── Заглушки для симуляции ───────────────────────────────────────────────
 
+    def _figi_to_ticker(self, figi: str) -> str | None:
+        """Конвертирует FIGI → тикер используя кэш или встроенную таблицу."""
+        # Сначала смотрим в кэше
+        if figi in self._figi_cache:
+            return self._figi_cache[figi].get("ticker")
+        # Встроенная таблица для основных инструментов
+        figi_map = {
+            "BBG004730N88": "SBER",
+            "BBG004731032": "LKOH",
+            "BBG004730ZJ9": "GAZP",
+            "BBG00475KKY8": "NVTK",
+            "BBG004731354": "ROSN",
+            "TCS109029557": "YDEX",
+            "BBG004RVFCY3": "MGNT",
+            "BBG000R608Y3": "MTSS",
+            "BBG004731489": "TATN",
+            "BBG004731996": "GMKN",
+            "BBG333333333": "TMOS",
+            "BBG222222222": "EQMX",
+        }
+        return figi_map.get(figi)
+
     def _mock_instrument(self, ticker: str) -> dict:
         """Фиктивный инструмент для симуляции."""
         mock_data = {
@@ -543,7 +583,7 @@ class TinkoffClient:
         }
 
     def _mock_price(self, figi: str) -> float:
-        """Фиктивная цена для симуляции."""
+        """Запасная цена если MOEX недоступен."""
         import random
         mock_prices = {
             "BBG004730N88": 280.0,   # SBER
@@ -553,7 +593,6 @@ class TinkoffClient:
             "BBG004731354": 520.0,   # ROSN
         }
         base = mock_prices.get(figi, 100.0)
-        # Добавляем небольшую случайность
         return round(base * (1 + random.uniform(-0.01, 0.01)), 2)
 
     def _mock_order(
