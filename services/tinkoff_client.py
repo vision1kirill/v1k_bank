@@ -55,60 +55,38 @@ class TinkoffClient:
         self.use_sandbox = use_sandbox
         self._account_id = account_id
         self._initialized = False
-        self._package_available = False  # True только если tinkoff пакет установлен
+        self._rest: "TinkoffRestClient | None" = None  # REST-клиент T-Bank API
 
         # Кэши
-        self._instruments_cache: dict[str, dict] = {}  # ticker → instrument info
-        self._figi_cache: dict[str, dict] = {}          # figi → instrument info
-        self._price_cache: dict[str, tuple[float, datetime]] = {}  # figi → (price, time)
+        self._instruments_cache: dict[str, dict] = {}
+        self._figi_cache: dict[str, dict] = {}
+        self._price_cache: dict[str, tuple[float, datetime]] = {}
         self._PRICE_CACHE_TTL = 60  # секунды
 
     async def initialize(self) -> None:
-        """Проверяем соединение и получаем account_id если не задан."""
+        """Инициализация: подключаемся к T-Bank через REST API."""
         if not self.token:
-            logger.warning("Tinkoff токен не задан. Клиент работает в режиме симуляции.")
+            logger.warning("T-Bank токен не задан. Цены берутся с MOEX (бесплатно). Ордера симулируются.")
             self._initialized = True
             return
 
-        try:
-            # Проверяем что пакет установлен
-            from tinkoff.invest import AsyncClient
-            self._package_available = True
-        except ImportError:
-            logger.warning(
-                "Пакет tinkoff-investments не установлен. "
-                "Бот работает в режиме симуляции (без реальных сделок)."
-            )
-            self._initialized = True
-            return
+        # Используем REST-клиент — никаких grpc-пакетов не нужно
+        from services.tinkoff_rest import TinkoffRestClient
+        self._rest = TinkoffRestClient(
+            token=self.token,
+            use_sandbox=self.use_sandbox,
+            account_id=self._account_id,
+        )
+        ok = await self._rest.ensure_account()
+        if ok:
+            self._account_id = self._rest.account_id
+            mode = "SANDBOX" if self.use_sandbox else "РЕАЛЬНЫЙ"
+            logger.info(f"T-Bank REST API подключён. Режим: {mode}. Счёт: {self._account_id}")
+        else:
+            logger.error("Не удалось подключиться к T-Bank API. Проверь токен.")
+            self._rest = None
 
-        try:
-            from tinkoff.invest import AsyncClient
-            async with AsyncClient(self.token) as client:
-                if self.use_sandbox:
-                    accounts = await client.sandbox.get_sandbox_accounts()
-                    if not accounts.accounts:
-                        opened = await client.sandbox.open_sandbox_account()
-                        self._account_id = opened.account_id
-                        logger.info(f"Открыт sandbox счёт: {self._account_id}")
-                    else:
-                        if not self._account_id:
-                            self._account_id = accounts.accounts[0].id
-                        logger.info(f"Используем sandbox счёт: {self._account_id}")
-                else:
-                    accounts = await client.users.get_accounts()
-                    if not accounts.accounts:
-                        raise ValueError("Нет доступных торговых счетов в T-Bank")
-                    if not self._account_id:
-                        self._account_id = accounts.accounts[0].id
-                    logger.info(f"Подключён к реальному счёту: {self._account_id}")
-
-            self._initialized = True
-            logger.info(f"T-Bank клиент инициализирован. Sandbox: {self.use_sandbox}")
-
-        except Exception as e:
-            logger.error(f"Ошибка инициализации T-Bank клиента: {e}")
-            self._initialized = True
+        self._initialized = True
 
     @property
     def account_id(self) -> str:
@@ -116,8 +94,8 @@ class TinkoffClient:
 
     @property
     def is_available(self) -> bool:
-        """True если есть токен, пакет установлен, и можно делать сделки."""
-        return bool(self.token and self._initialized and self._package_available)
+        """True если есть токен и REST-клиент успешно инициализирован."""
+        return bool(self.token and self._initialized and self._rest is not None)
 
     # ─── Поиск инструментов ───────────────────────────────────────────────────
 
@@ -133,34 +111,18 @@ class TinkoffClient:
 
         if not self.is_available:
             instrument = self._mock_instrument(ticker)
-            # Заполняем кэш чтобы _figi_to_ticker работал
             self._figi_cache[instrument["figi"]] = instrument
             self._instruments_cache[ticker] = instrument
             return instrument
 
         try:
-            from tinkoff.invest import AsyncClient, InstrumentStatus
-            async with AsyncClient(self.token) as client:
-                resp = await client.instruments.find_instrument(query=ticker)
-                for inst in resp.instruments:
-                    if inst.ticker.upper() == ticker and inst.class_code in ("TQBR", "TQTF", "TQOB"):
-                        data = {
-                            "figi": inst.figi,
-                            "ticker": inst.ticker,
-                            "name": inst.name,
-                            "lot": inst.lot,
-                            "currency": inst.currency,
-                            "class_code": inst.class_code,
-                            "isin": inst.isin,
-                            "exchange": "MOEX",
-                        }
-                        self._instruments_cache[ticker] = data
-                        self._figi_cache[inst.figi] = data
-                        return data
-
+            data = await self._rest.find_instrument(ticker)
+            if data:
+                self._instruments_cache[ticker] = data
+                self._figi_cache[data["figi"]] = data
+                return data
             logger.warning(f"Инструмент не найден: {ticker}")
             return None
-
         except Exception as e:
             logger.error(f"Ошибка поиска инструмента {ticker}: {e}")
             return None
@@ -217,14 +179,10 @@ class TinkoffClient:
             return self._mock_price(figi)
 
         try:
-            from tinkoff.invest import AsyncClient
-            async with AsyncClient(self.token) as client:
-                resp = await client.market_data.get_last_prices(figi=[figi])
-                if resp.last_prices:
-                    price = _quotation_to_float(resp.last_prices[0].price)
-                    self._price_cache[figi] = (price, datetime.utcnow())
-                    return price
-            return None
+            price = await self._rest.get_last_price(figi)
+            if price:
+                self._price_cache[figi] = (price, datetime.utcnow())
+            return price
         except Exception as e:
             logger.error(f"Ошибка получения цены {figi}: {e}")
             return None
@@ -250,35 +208,14 @@ class TinkoffClient:
             return self._mock_candles(figi, days)
 
         try:
-            from tinkoff.invest import AsyncClient, CandleInterval
             interval_map = {
-                "1min": CandleInterval.CANDLE_INTERVAL_1_MIN,
-                "5min": CandleInterval.CANDLE_INTERVAL_5_MIN,
-                "hour": CandleInterval.CANDLE_INTERVAL_HOUR,
-                "day": CandleInterval.CANDLE_INTERVAL_DAY,
+                "1min": "CANDLE_INTERVAL_1_MIN",
+                "5min": "CANDLE_INTERVAL_5_MIN",
+                "hour": "CANDLE_INTERVAL_HOUR",
+                "day": "CANDLE_INTERVAL_DAY",
             }
-            interval = interval_map.get(interval_str, CandleInterval.CANDLE_INTERVAL_DAY)
-            now = datetime.now(timezone.utc)
-            from_ = now - timedelta(days=days)
-
-            async with AsyncClient(self.token) as client:
-                resp = await client.market_data.get_candles(
-                    figi=figi,
-                    from_=from_,
-                    to=now,
-                    interval=interval,
-                )
-                return [
-                    {
-                        "time": c.time,
-                        "open": _quotation_to_float(c.open),
-                        "high": _quotation_to_float(c.high),
-                        "low": _quotation_to_float(c.low),
-                        "close": _quotation_to_float(c.close),
-                        "volume": c.volume,
-                    }
-                    for c in resp.candles
-                ]
+            interval = interval_map.get(interval_str, "CANDLE_INTERVAL_DAY")
+            return await self._rest.get_candles(figi, days, interval)
         except Exception as e:
             logger.error(f"Ошибка получения свечей {figi}: {e}")
             return []
@@ -304,45 +241,11 @@ class TinkoffClient:
             return self._mock_order(figi, lots, direction)
 
         try:
-            from tinkoff.invest import AsyncClient, OrderDirection, OrderType
-            direction_map = {
-                "buy": OrderDirection.ORDER_DIRECTION_BUY,
-                "sell": OrderDirection.ORDER_DIRECTION_SELL,
-            }
-
-            async with AsyncClient(self.token) as client:
-                if self.use_sandbox:
-                    resp = await client.sandbox.post_sandbox_order(
-                        figi=figi,
-                        quantity=lots,
-                        account_id=self._account_id,
-                        direction=direction_map[direction],
-                        order_type=OrderType.ORDER_TYPE_MARKET,
-                        order_id=f"bot_{strategy_id}_{int(datetime.utcnow().timestamp())}",
-                    )
-                else:
-                    resp = await client.orders.post_order(
-                        figi=figi,
-                        quantity=lots,
-                        account_id=self._account_id,
-                        direction=direction_map[direction],
-                        order_type=OrderType.ORDER_TYPE_MARKET,
-                        order_id=f"bot_{strategy_id}_{int(datetime.utcnow().timestamp())}",
-                    )
-
-                executed_price = _money_to_float(resp.executed_order_price)
-                if executed_price == 0:
-                    executed_price = _money_to_float(resp.initial_order_price)
-
-                return {
-                    "order_id": resp.order_id,
-                    "status": str(resp.execution_report_status),
-                    "price": executed_price,
-                    "lots": lots,
-                    "amount": executed_price * lots,
-                    "commission": _money_to_float(resp.initial_commission),
-                }
-
+            return await self._rest.place_order(
+                figi=figi, lots=lots, direction=direction,
+                order_type="market",
+                order_id=f"bot_{strategy_id}_{int(datetime.utcnow().timestamp())}",
+            )
         except Exception as e:
             logger.error(f"Ошибка размещения ордера {direction} {figi} x{lots}: {e}")
             return None
@@ -360,43 +263,11 @@ class TinkoffClient:
             return self._mock_order(figi, lots, direction, price=price, is_limit=True)
 
         try:
-            from tinkoff.invest import AsyncClient, OrderDirection, OrderType
-            direction_map = {
-                "buy": OrderDirection.ORDER_DIRECTION_BUY,
-                "sell": OrderDirection.ORDER_DIRECTION_SELL,
-            }
-
-            async with AsyncClient(self.token) as client:
-                if self.use_sandbox:
-                    resp = await client.sandbox.post_sandbox_order(
-                        figi=figi,
-                        quantity=lots,
-                        price=_float_to_quotation(price),
-                        account_id=self._account_id,
-                        direction=direction_map[direction],
-                        order_type=OrderType.ORDER_TYPE_LIMIT,
-                        order_id=f"grid_{strategy_id}_{int(price * 100)}_{direction}",
-                    )
-                else:
-                    resp = await client.orders.post_order(
-                        figi=figi,
-                        quantity=lots,
-                        price=_float_to_quotation(price),
-                        account_id=self._account_id,
-                        direction=direction_map[direction],
-                        order_type=OrderType.ORDER_TYPE_LIMIT,
-                        order_id=f"grid_{strategy_id}_{int(price * 100)}_{direction}",
-                    )
-
-                return {
-                    "order_id": resp.order_id,
-                    "status": "pending",
-                    "price": price,
-                    "lots": lots,
-                    "amount": price * lots,
-                    "commission": _money_to_float(resp.initial_commission),
-                }
-
+            return await self._rest.place_order(
+                figi=figi, lots=lots, direction=direction,
+                order_type="limit", price=price,
+                order_id=f"grid_{strategy_id}_{int(price * 100)}_{direction}",
+            )
         except Exception as e:
             logger.error(f"Ошибка лимитного ордера {direction} {figi} x{lots} @ {price}: {e}")
             return None
@@ -407,17 +278,7 @@ class TinkoffClient:
             return True  # в симуляции всегда успех
 
         try:
-            from tinkoff.invest import AsyncClient
-            async with AsyncClient(self.token) as client:
-                if self.use_sandbox:
-                    await client.sandbox.cancel_sandbox_order(
-                        account_id=self._account_id, order_id=order_id
-                    )
-                else:
-                    await client.orders.cancel_order(
-                        account_id=self._account_id, order_id=order_id
-                    )
-            return True
+            return await self._rest.cancel_order(order_id)
         except Exception as e:
             logger.error(f"Ошибка отмены ордера {order_id}: {e}")
             return False
@@ -428,24 +289,7 @@ class TinkoffClient:
             return {"order_id": order_id, "status": "filled", "price": 0.0}
 
         try:
-            from tinkoff.invest import AsyncClient
-            async with AsyncClient(self.token) as client:
-                if self.use_sandbox:
-                    resp = await client.sandbox.get_sandbox_order_state(
-                        account_id=self._account_id, order_id=order_id
-                    )
-                else:
-                    resp = await client.orders.get_order_state(
-                        account_id=self._account_id, order_id=order_id
-                    )
-
-                return {
-                    "order_id": order_id,
-                    "status": str(resp.execution_report_status),
-                    "price": _money_to_float(resp.average_position_price),
-                    "filled_lots": resp.lots_executed,
-                    "total_lots": resp.lots_requested,
-                }
+            return await self._rest.get_order_state(order_id)
         except Exception as e:
             logger.error(f"Ошибка статуса ордера {order_id}: {e}")
             return None
@@ -463,37 +307,7 @@ class TinkoffClient:
             return []
 
         try:
-            from tinkoff.invest import AsyncClient
-            async with AsyncClient(self.token) as client:
-                if self.use_sandbox:
-                    resp = await client.sandbox.get_sandbox_operations(
-                        account_id=self._account_id,
-                        from_=from_date,
-                        to=to_date,
-                    )
-                else:
-                    resp = await client.operations.get_operations(
-                        account_id=self._account_id,
-                        from_=from_date,
-                        to=to_date,
-                    )
-
-                result = []
-                for op in resp.operations:
-                    op_type = str(op.operation_type)
-                    if operation_types and not any(t in op_type for t in operation_types):
-                        continue
-                    result.append({
-                        "id": op.id,
-                        "type": op_type,
-                        "figi": op.figi,
-                        "date": op.date,
-                        "amount": _money_to_float(op.payment),
-                        "currency": op.currency,
-                        "quantity": op.quantity,
-                        "price": _money_to_float(op.price),
-                    })
-                return result
+            return await self._rest.get_operations(from_date, to_date, operation_types)
         except Exception as e:
             logger.error(f"Ошибка получения операций: {e}")
             return []
@@ -506,32 +320,7 @@ class TinkoffClient:
             return {"total_amount": 0.0, "expected_yield": 0.0}
 
         try:
-            from tinkoff.invest import AsyncClient
-            async with AsyncClient(self.token) as client:
-                if self.use_sandbox:
-                    resp = await client.sandbox.get_sandbox_portfolio(
-                        account_id=self._account_id
-                    )
-                else:
-                    resp = await client.operations.get_portfolio(
-                        account_id=self._account_id
-                    )
-
-                return {
-                    "total_amount": _money_to_float(resp.total_amount_portfolio),
-                    "expected_yield": _money_to_float(resp.expected_yield),
-                    "positions": [
-                        {
-                            "figi": p.figi,
-                            "quantity": p.quantity.units,
-                            "current_price": _money_to_float(p.current_price),
-                            "avg_buy_price": _money_to_float(p.average_buy_price),
-                            "current_nkd": _money_to_float(p.current_nkd) if hasattr(p, 'current_nkd') else 0,
-                            "expected_yield": _money_to_float(p.expected_yield),
-                        }
-                        for p in resp.positions
-                    ]
-                }
+            return await self._rest.get_portfolio()
         except Exception as e:
             logger.error(f"Ошибка получения портфеля: {e}")
             return {"total_amount": 0.0, "expected_yield": 0.0, "positions": []}
