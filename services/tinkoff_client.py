@@ -55,6 +55,7 @@ class TinkoffClient:
         self.use_sandbox = use_sandbox
         self._account_id = account_id
         self._initialized = False
+        self._package_available = False  # True только если tinkoff пакет установлен
 
         # Кэши
         self._instruments_cache: dict[str, dict] = {}  # ticker → instrument info
@@ -70,11 +71,21 @@ class TinkoffClient:
             return
 
         try:
+            # Проверяем что пакет установлен
+            from tinkoff.invest import AsyncClient
+            self._package_available = True
+        except ImportError:
+            logger.warning(
+                "Пакет tinkoff-investments не установлен. "
+                "Бот работает в режиме симуляции (без реальных сделок)."
+            )
+            self._initialized = True
+            return
+
+        try:
             from tinkoff.invest import AsyncClient
             async with AsyncClient(self.token) as client:
                 if self.use_sandbox:
-                    from tinkoff.invest import SandboxService
-                    # Открываем sandbox счёт если нет
                     accounts = await client.sandbox.get_sandbox_accounts()
                     if not accounts.accounts:
                         opened = await client.sandbox.open_sandbox_account()
@@ -95,12 +106,6 @@ class TinkoffClient:
             self._initialized = True
             logger.info(f"T-Bank клиент инициализирован. Sandbox: {self.use_sandbox}")
 
-        except ImportError:
-            logger.error(
-                "Пакет tinkoff-investments не установлен. "
-                "Выполни: pip install tinkoff-investments"
-            )
-            self._initialized = True  # работаем без брокера
         except Exception as e:
             logger.error(f"Ошибка инициализации T-Bank клиента: {e}")
             self._initialized = True
@@ -111,8 +116,8 @@ class TinkoffClient:
 
     @property
     def is_available(self) -> bool:
-        """True если есть токен и можно делать сделки."""
-        return bool(self.token and self._initialized)
+        """True если есть токен, пакет установлен, и можно делать сделки."""
+        return bool(self.token and self._initialized and self._package_available)
 
     # ─── Поиск инструментов ───────────────────────────────────────────────────
 
