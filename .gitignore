@@ -1,0 +1,34 @@
+# Секреты — НИКОГДА не заливать!
+.env
+*.env
+
+# База данных
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Python кэш
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# Логи
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
