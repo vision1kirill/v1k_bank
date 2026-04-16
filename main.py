@@ -3,7 +3,10 @@
 """
 import asyncio
 import logging
+import os
 import sys
+import threading
+import http.server
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -36,6 +39,29 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def start_health_server() -> None:
+    """
+    Запускает минимальный HTTP-сервер для Railway healthcheck.
+    Railway проверяет GET / и ожидает 200 OK.
+    Работает в фоновом потоке, не мешает боту.
+    """
+    port = int(os.environ.get("PORT", 8080))
+
+    class HealthHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format, *args):
+            pass  # подавляем логи healthcheck
+
+    server = http.server.HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"Health server запущен на порту {port}")
+    server.serve_forever()
 
 
 async def text_router(update: Update, context) -> None:
@@ -92,6 +118,10 @@ async def callback_router(update: Update, context) -> None:
 
 
 def main() -> None:
+    # ─── Health server для Railway (фоновый поток) ─────────────────────────
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+
     # ─── Валидация конфига ─────────────────────────────────────────────────
     Config.validate()
 
